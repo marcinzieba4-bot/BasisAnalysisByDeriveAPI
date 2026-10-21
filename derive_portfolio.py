@@ -435,6 +435,12 @@ def analyse(
         )
 
     delta_usd_per_pct = sum(d * index_by_ccy.get(c, 0.0) * 0.01 for c, d in delta_by_ccy.items())
+    # Requirements scale with price, so a book holding less delta than requirement / price loses
+    # headroom as the underlying rallies (soft upside liquidation even when fully hedged).
+    ref_ccy = underlying_of(ref["instrument"]) if ref else None
+    ref_idx = index_by_ccy.get(ref_ccy or "", 0.0)
+    neutral_mm = (equity - mm) / ref_idx if ref_idx else None
+    neutral_im = (equity - im) / ref_idx if ref_idx else None
     carry_total_30d = carry["perp_funding_30d"] + carry["lending"] + carry["staking"] + carry["option_theta"]
     carry_total_now = carry["perp_funding_now"] + carry["lending"] + carry["staking"] + carry["option_theta"]
 
@@ -449,6 +455,8 @@ def analyse(
             "projected_mm_after_next_expiry_usd": round(mm + projected, 2),
             "below_initial_margin": im < 0,
             "is_under_liquidation": subaccount.get("is_under_liquidation"),
+            "margin_neutral_delta": {"ccy": ref_ccy, "mm": round(neutral_mm, 2) if neutral_mm else None,
+                                     "im": round(neutral_im, 2) if neutral_im else None},
         },
         "net_delta": {c: round(d, 4) for c, d in delta_by_ccy.items()},
         "net_delta_usd_per_1pct_move": round(delta_usd_per_pct, 2),
@@ -480,6 +488,10 @@ def print_summary(wallet: str, sub_id: int, a: dict[str, Any]) -> None:
     print(f"MM after next expiry settles: ${m['projected_mm_after_next_expiry_usd']:,.2f}")
     deltas = "  ".join(f"{c}={d:+,.2f}" for c, d in a["net_delta"].items())
     print(f"Net delta: {deltas}   (${a['net_delta_usd_per_1pct_move']:+,.0f} per +1% move)")
+    nd = m["margin_neutral_delta"]
+    if nd["mm"]:
+        print(f"Margin-neutral delta: MM {nd['mm']:,.1f} {nd['ccy']} / IM {nd['im']:,.1f} {nd['ccy']}"
+              "  (below this, rallies shrink headroom even if hedged)")
     if a["depeg_usd_per_1pct"]:
         print(f"LST/wrapped depeg: -${a['depeg_usd_per_1pct']:,.0f} per 1% depeg"
               f"  -> MM headroom gone at ~{a['depeg_pct_to_mm_zero']}% depeg")
