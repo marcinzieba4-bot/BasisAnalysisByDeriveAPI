@@ -391,6 +391,8 @@ def analyse(
                     "unrealized_pnl": round(upnl, 2),
                     "pending_funding": round(_f(p.get("pending_funding")), 2),
                     "cumulative_funding": round(_f(p.get("cumulative_funding")), 2),
+                    # Engine's account-level liquidation price (index at which MM hits 0).
+                    "liquidation_price": round(_f(p.get("liquidation_price")), 2) if p.get("liquidation_price") else None,
                 }
             )
         else:
@@ -497,6 +499,9 @@ def print_summary(wallet: str, sub_id: int, a: dict[str, Any]) -> None:
                 f"notional=${r['notional_usd']:,.0f}  uPnL=${r['unrealized_pnl']:,.2f}  "
                 f"pendingFunding=${r['pending_funding']:,.2f}"
             )
+            if r["liquidation_price"] and r["index"]:
+                print(f"    liquidation price ${r['liquidation_price']:,.0f}"
+                      f"  ({(r['liquidation_price'] / r['index'] - 1) * 100:+.0f}% from index)")
     if a["forward_curve"]:
         print("\nForward curve (option-implied) vs perp funding (30d):")
         for f in a["forward_curve"]:
