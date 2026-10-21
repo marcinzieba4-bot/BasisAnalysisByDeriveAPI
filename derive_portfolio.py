@@ -54,6 +54,7 @@ from eth_account.messages import encode_defunct
 BASE_URL_DEFAULT = "https://api.lyra.finance"
 HEX_KEY_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 CANDIDATE_KEY_VARS = [
+    "DERIVE_API",
     "DERIVE_PRIVATE_KEY",
     "DERIVE_SESSION_KEY",
     "DERIVE_API_KEY",
