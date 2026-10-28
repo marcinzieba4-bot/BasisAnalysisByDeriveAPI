@@ -15,7 +15,9 @@ Given the time the trade was opened (--since), this script:
      funding APR;
   3. reports the book's per-currency net delta (old book vs new trade);
   4. asks Derive's margin engine what happens if the options expire while
-     the perps stay open.
+     the perps stay open, how much perp can be bought back alone before
+     settlement without extra margin, and whether closing in hedged
+     call+put+perp chunks keeps margin positive.
 
 Usage
 -----
@@ -139,6 +141,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             continue
         inst = client.post("public/get_instrument", {"instrument_name": n}, auth=False)
         expiry = datetime.fromtimestamp(int(inst["option_details"]["expiry"]), timezone.utc)
+        last_trade = datetime.fromtimestamp(int(inst["scheduled_deactivation"]), timezone.utc)
         days = (expiry - now).total_seconds() / 86400
         qty = legs[n]["qty"]
         fwd_locked = float(strike) + legs[n]["cost"] / qty - legs[put]["cost"] / legs[put]["qty"]
@@ -156,6 +159,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         fixed = basis * qty + entry_fees + exit_fee
         pairs.append({
             "currency": ccy, "call": n, "put": put, "perp": perp, "qty": qty, "expiry": expiry.isoformat(),
+            "options_stop_trading": last_trade.isoformat(),
             "days_to_expiry": days, "forward_locked": fwd_locked, "perp_sold": perp_avg,
             "basis_per_unit": basis, "basis_apr_pct": basis / perp_avg * 365 / days * 100,
             "basis_cost": -basis * qty, "entry_fees": -entry_fees, "est_exit_fee": -exit_fee,
@@ -180,10 +184,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         if ccy and ccy != "USDC":
             delta.setdefault(ccy, {"old": 0.0, "new": 0.0})["old"] += _f(c["amount"]) * _f(c.get("delta"), 1.0)
 
-    # ---- 4. margin if the options expire and the perps stay open --------------------------------
+    # ---- 4. expiry: what the margin engine allows around settlement ------------------------------
+    def margin_after(changes: list[dict[str, str]]) -> tuple[float, float]:
+        r = client.post("private/get_margin", {"subaccount_id": sid, "simulated_position_changes": changes})
+        return _f(r["post_initial_margin"]), _f(r["post_maintenance_margin"])
+
     expire = [{"instrument_name": n, "amount": str(-legs[n]["qty"])}
               for n in legs if not n.endswith("-PERP") and n in pos]
     expiry_check = client.post("private/get_margin", {"subaccount_id": sid, "simulated_position_changes": expire})
+
+    # Buying back the perp alone while the options are live leaves the book net long. Find how much
+    # can go before free IM turns negative (IM is not monotonic: a small buyback can free margin).
+    for p in pairs:
+        short = -legs[p["perp"]]["qty"]
+        buy = lambda k: [{"instrument_name": p["perp"], "amount": f"{k:.3f}"}]
+        step = short / 8
+        ok = 0.0
+        for i in range(1, 9):
+            if margin_after(buy(step * i))[0] < 0:
+                break
+            ok = step * i
+        lo, hi = ok, min(short, ok + step)
+        for _ in range(4):
+            if lo >= short:
+                break
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if margin_after(buy(mid))[0] >= 0 else (lo, mid)
+        chunk = short / 4
+        p["perp_alone_max"] = lo
+        p["perp_alone_all_extra_im"] = max(0.0, -margin_after(buy(short))[0])
+        p["hedged_quarter_chunk_im_mm"] = margin_after([
+            {"instrument_name": p["perp"], "amount": f"{chunk:.3f}"},
+            {"instrument_name": p["call"], "amount": f"{-chunk:.3f}"},
+            {"instrument_name": p["put"], "amount": f"{chunk:.3f}"},
+        ])
 
     # ---- report ----------------------------------------------------------------------------------
     a = attribution
@@ -213,8 +247,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"\nFree MM now {_f(expiry_check['pre_maintenance_margin']):,.2f}; if the options expire with the "
           f"perps still open: {post_mm:,.2f}")
     if post_mm < 0:
-        print("  WARNING: that is below maintenance margin. Buy back the perps at expiry (or roll) — "
-              "do not let the options settle against open perps.")
+        print("  WARNING: that is below maintenance margin — do not let the options settle against open perps.")
+    for p in pairs:
+        im, mm = p["hedged_quarter_chunk_im_mm"]
+        print(f"  {p['currency']}: options stop trading {p['options_stop_trading'][:16].replace('T', ' ')} UTC. "
+              f"Perp alone: up to {p['perp_alone_max']:.1f} of {-legs[p['perp']]['qty']:g} can be bought back "
+              f"before settlement without extra margin")
+        print(f"       (all of it alone needs ~{p['perp_alone_all_extra_im']:,.0f} more free IM). "
+              f"Closing 1/4 as call+put+perp together leaves free IM {im:,.0f} / MM {mm:,.0f}.")
     print("=" * 78)
 
     if args.json_out:

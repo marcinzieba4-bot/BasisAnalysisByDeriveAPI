@@ -59,8 +59,11 @@ It reports:
   to expiry at the current and trailing-average funding rate, with the
   break-even funding APR;
 - per-currency net delta for the old book and the new trade;
-- what Derive's margin engine says if the options expire while the perps are
-  still open — close or roll the perps at expiry.
+- what Derive's margin engine says around expiry: margin if the options settle
+  while the perps are still open, how much perp can be bought back alone
+  before settlement without extra margin, and margin after closing a quarter
+  as a hedged call+put+perp chunk. Re-run it the day before expiry — the
+  numbers move with the market.
 
 ## Output
 
