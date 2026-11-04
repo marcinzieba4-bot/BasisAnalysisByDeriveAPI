@@ -31,9 +31,17 @@ so a balanced perp pays shorts exactly 10.95% APR; a perp trading at a discount
 pays less, or negative. The trade earns that anchor minus the option-implied
 financing, so it lives or dies on how often the perp stays at the anchor.
 
+  breakdown --breakdown itemises the cost of the long forward: financing by
+            strike including the USDC borrowed to prepay an ITM call (and its
+            interest), and the cost of each roll method (2-way: close and reopen
+            the synthetic, keep the perp; 3-way: close and reopen all three
+            legs; expire + perp bridge), as screen taker and maker, with the
+            margin each path needs and recent public RFQ fills.
+
 Usage
 -----
   python3 roll_compare.py                                  # live snapshot
+  python3 roll_compare.py --breakdown --leverage 20 25     # + cost breakdown
   python3 roll_compare.py --history                        # + every past roll
   python3 roll_compare.py --history --path --leverage 20 25 30
 """
@@ -43,6 +51,7 @@ import argparse
 import bisect
 import calendar
 import json
+import math
 import os
 import statistics
 import sys
@@ -57,6 +66,8 @@ API_DEFAULT = "https://api.derive.xyz/v3"
 RPC_DEFAULT = "https://rpc.derive.xyz"
 ANCHOR = 0.0000125  # static interest rate per hour: 10.95% APR
 HOURS = 24 * 365
+MIN_MONEYNESS = 0.9  # lowest strike / index considered liquid enough to close at the next roll
+FEE_CAP = 0.125  # option fee is capped at 12.5% of the option price
 CUTOVER = int(datetime(2026, 10, 6, 17, 40, tzinfo=timezone.utc).timestamp())  # last v2 funding update
 FIRST_ROLL = int(datetime(2023, 12, 29, 8, tzinfo=timezone.utc).timestamp())
 BLOCK_REF = (46881370, 1793784355)  # Derive Chain block <-> unix time; blocks are exactly 2 s apart
@@ -202,7 +213,9 @@ def synthetic_quotes(api: Derive, ccy: str, expiry: int, S: float, now: float) -
             continue
         K = float(name.split("-")[2])
         p = tick.get(name[:-1] + "P")
-        if p is None or K > S:  # ITM-call side only, like the trade
+        # ITM-call side, but not deep: strikes below ~0.9 x index have no two-sided book near expiry,
+        # so they are cheap to open and expensive to close at the next roll.
+        if p is None or K > S or K < MIN_MONEYNESS * S:
             continue
         ca, pb = float(c["a"] or 0), float(p["b"] or 0)
         if ca <= 0 or float(c["A"] or 0) <= 0 or float(p["B"] or 0) <= 0:
@@ -244,15 +257,25 @@ def live(api: Derive, ccy: str, now: float, notional: float, fee_rate: float) ->
     monthlies = [e for e in expiries if is_monthly(e) and (e - now) > 2 * 86400][:2]
     quotes = [synthetic_quotes(api, ccy, e, S, now) for e in monthlies]
     margins = [pm2_margin(api, ccy, q, notional, S) for q in quotes if q["best"]]
+    near = [e for e in expiries if 0.5 * 86400 <= e - now <= 3.5 * 86400]  # proxy for the old monthly on roll day
+    old = _chain(api, ccy, near[0]) if near else {}
+
+    def fee(price: float) -> float:  # taker fee per leg: min(rate x index, 12.5% x option price); base fee ignored
+        return min(fee_rate * S, FEE_CAP * price)
+
     for q in quotes:
         b, days = q["best"], q["days"]
         if b:
-            # taker fee per leg: min(rate x index, 12.5% x option price); base fee ignored (per order).
-            # Executable financing = implied at mark + crossing cost + fees. (A deep-ITM call prepays
-            # premium that Derive discounts at the implied rate; financed by a USDC borrow that is
-            # roughly a wash, so it is left out here.)
-            fee = min(fee_rate * S, 0.125 * b["call_mark"]) + min(fee_rate * S, 0.125 * b["put_mark"])
-            q["roll_cost_pct"] = (b["exec_minus_mark"] + fee) / S
+            # Roll cost (taker, 2-way): open this synthetic + close a same-moneyness one about a day before expiry.
+            # Executable financing = implied at mark + roll cost. Interest on premium prepaid for an ITM strike
+            # is in --breakdown (option marks discount it at ~3.5-4%, below the USDC borrow rate).
+            close = 0.0
+            if old:
+                _, oc, op = old[_nearest(old, b["strike"])]
+                ocm, opm, ocb, opa = float(oc["M"]), float(op["M"]), _px(oc, "b"), _px(op, "a")
+                if ocb is not None and opa is not None and ocb > 0.5 * ocm:
+                    close = (ocm - ocb) + (opa - opm) + fee(ocm) + fee(opm)
+            q["roll_cost_pct"] = (b["exec_minus_mark"] + fee(b["call_mark"]) + fee(b["put_mark"]) + close) / S
             q["implied_exec_apr"] = q["implied_apr"] + q["roll_cost_pct"] * 365 / days
     return {"currency": ccy, "index": S, "perp_mark": mark, "perp_premium": mark / S - 1,
             "funding_now_apr": f_now * HOURS, "funding_7d": funding_stats(rates[-168:]),
@@ -274,8 +297,8 @@ def print_live(snaps: list[dict[str, Any]], leverage: list[float]) -> None:
             line = (f"  {q['expiry']} ({q['days']:.1f}d): implied {q['implied_apr'] * 100:.2f}% APR at mark "
                     f"(df {q['df']})")
             if b:
-                line += (f"; cheapest ITM-call synthetic K={b['strike']:,.0f}: executable + fees "
-                         f"{q['implied_exec_apr'] * 100:.2f}% APR (roll cost {q['roll_cost_pct'] * 1e4:.0f}bp)")
+                line += (f"; cheapest synthetic K={b['strike']:,.0f} (>= {MIN_MONEYNESS:g}x index): with roll cost "
+                         f"{q['implied_exec_apr'] * 100:.2f}% APR (open + close, taker: {q['roll_cost_pct'] * 1e4:.0f}bp)")
             print(line)
         for m in s["margins"]:
             print(f"  PM2 margin, {m['days']:.0f}d synthetic vs perp: IM {m['im_pct'] * 100:.2f}% -> max "
@@ -287,6 +310,235 @@ def print_live(snaps: list[dict[str, Any]], leverage: list[float]) -> None:
                 roe = "  ".join(f"{L:g}x {L * c_exec * 100:+.0f}%" for L in leverage)
                 print(f"  carry @ funding {lbl:>3}: {c_mark * 100:+.2f}% at mark, {c_exec * 100:+.2f}% executable"
                       f" -> ROE {roe}")
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# Breakdown: financing by strike (incl. the USDC borrow) and roll cost by method
+# --------------------------------------------------------------------------- #
+TARGET_MONEYNESS = (1.0, 0.95, 0.9, 0.85, 0.8)
+
+
+def _px(t: dict[str, Any], side: str) -> Optional[float]:
+    """Best bid ('b') or ask ('a') with size, else None."""
+    size = float(t.get(side.upper()) or 0)
+    return float(t[side]) if size > 0 and t.get(side) is not None else None
+
+
+def usdc_rates(api: Derive, ccy: str) -> tuple[float, float]:
+    """(borrow APY, supply APY) of USDC in the risk universe the currency trades in."""
+    cur = api.post("public/get_currency", {"currency": ccy})
+    uid = (cur.get("managers") or [{}])[0].get("risk_universe_id", 1)
+    for u in api.post("public/get_currency", {"currency": "USDC"})["spot"][0]["universes"]:
+        if u["risk_universe_id"] == uid and u.get("lending"):
+            return float(u["lending"]["borrow_apy"]), float(u["lending"]["supply_apy"])
+    raise SystemExit("USDC lending rates not found")
+
+
+def _chain(api: Derive, ccy: str, expiry: int) -> dict[float, tuple[str, dict[str, Any], dict[str, Any]]]:
+    tick = api.post("public/get_tickers", {"currency": ccy, "instrument_type": "option",
+                                           "expiry_date": utc(expiry).strftime("%Y%m%d")})["tickers"]
+    return {float(n.split("-")[2]): (n[:-2], tick[n], tick[n[:-1] + "P"])
+            for n in tick if n.endswith("-C") and n[:-1] + "P" in tick}
+
+
+def _nearest(chain: dict[float, Any], target: float) -> float:
+    return min(chain, key=lambda k: abs(k - target))
+
+
+def _margin_pct(api: Derive, ccy: str, positions: list[tuple[str, float]], value: float, notional: float) -> tuple[float, float]:
+    usdc = 10 * notional
+    r = api.post("public/get_margin", {
+        "margin_type": "PM2", "market": ccy, "simulated_collaterals": [{"asset_name": "USDC", "amount": str(usdc)}],
+        "simulated_positions": [{"instrument_name": n, "amount": f"{a:.6f}"} for n, a in positions]})
+    v = usdc + value
+    return (v - float(r["post_initial_margin"])) / notional, (v - float(r["post_maintenance_margin"])) / notional
+
+
+def rfq_synthetic_stats(api: Derive, ccy: str, now: float, days: int) -> dict[str, tuple[int, float, float]]:
+    """Public RFQ fills of 2-leg synthetics (call + put, same strike/expiry): net price vs mark."""
+    legs: dict[str, list[dict[str, Any]]] = {}
+    t, end = int((now - days * 86400) * 1000), int(now * 1000)
+    while t < end:
+        t2, page = min(t + 2 * 86400_000, end), 1
+        while True:
+            r = api.post("public/get_trade_history", {"currency": ccy, "instrument_type": "option", "from_timestamp": t,
+                                                      "to_timestamp": t2, "page_size": 1000, "page": page})
+            for x in r.get("trades", []):
+                if x.get("rfq_id") and x.get("liquidity_role") == "taker":
+                    legs.setdefault(x["rfq_id"], []).append(x)
+            if page >= ((r.get("pagination") or {}).get("num_pages") or 1) or not r.get("trades"):
+                break
+            page += 1
+        t = t2
+    buckets: dict[str, list[tuple[float, float]]] = {}
+    for pk in legs.values():
+        if len(pk) != 2:
+            continue
+        a, b = sorted(pk, key=lambda x: x["instrument_name"][-1])  # C first, then P
+        na, nb = a["instrument_name"].split("-"), b["instrument_name"].split("-")
+        if (na[3], nb[3]) != ("C", "P") or na[1:3] != nb[1:3] or a["trade_amount"] != b["trade_amount"]:
+            continue
+        S, K = float(a["index_price"]), float(na[2])
+        dte = (int(datetime.strptime(na[1], "%Y%m%d").replace(hour=8, tzinfo=timezone.utc).timestamp()) * 1000
+               - a["timestamp"]) / 86400_000
+        sgn = {"buy": 1.0, "sell": -1.0}
+        net = sum(sgn[x["direction"]] * (float(x["trade_price"]) - float(x["mark_price"])) for x in (a, b)) / S
+        kind = {("buy", "sell"): "open", ("sell", "buy"): "close"}.get((a["direction"], b["direction"]))
+        if kind == "open" and 10 <= dte <= 40 and 0.9 <= K / S <= 1.05:
+            key = "open 10-40d, K 0.9-1.05x"
+        elif kind == "close" and dte <= 3:
+            key = "close <=3d, K 0.9-1.05x" if 0.9 <= K / S <= 1.05 else ("close <=3d, K <0.88x" if K / S < 0.88 else "")
+        else:
+            key = ""
+        if key:
+            buckets.setdefault(key, []).append((net, float(a["trade_amount"]) * S))
+    return {k: (len(v), sum(n for _, n in v), statistics.median(x for x, _ in v)) for k, v in buckets.items()}
+
+
+def breakdown(api: Derive, ccy: str, now: float, leverage: list[float], notional: float,
+              rates: tuple[float, float], rfq_days: int) -> dict[str, Any]:
+    perp = api.post("public/get_ticker", {"instrument_name": f"{ccy}-PERP"})
+    S, pbid, pask = float(perp["I"]), float(perp["b"]), float(perp["a"])
+    inst = api.post("public/get_instrument", {"instrument_name": f"{ccy}-PERP"})
+    p_taker, p_maker = float(inst["taker_fee_rate"]), float(inst["maker_fee_rate"])
+    ins = api.post("public/get_all_instruments", {"currency": ccy, "instrument_type": "option",
+                                                  "expired": False, "page_size": 1000})["instruments"]
+    o_taker, o_maker = float(ins[0]["taker_fee_rate"]), float(ins[0]["maker_fee_rate"])
+    expiries = sorted({int(i["option_details"]["expiry"]) for i in ins if i["is_active"]})
+    monthlies = [e for e in expiries if is_monthly(e) and e - now > 7 * 86400]
+    new = min(monthlies[:2], key=lambda e: abs((e - now) / 86400 - 28))  # the one closest to a fresh monthly
+    near = [e for e in expiries if 0.5 * 86400 <= e - now <= 3.5 * 86400]  # proxy: old monthly on roll day
+    T = (new - now) / 86400 / 365
+    rb, rs = rates
+    cn = _chain(api, ccy, new)
+    co = _chain(api, ccy, near[0]) if near else {}
+
+    def fee(rate: float, price: float) -> float:
+        return min(rate * S, FEE_CAP * price)
+
+    # Discount rate inside option marks: C - P = df x (F - K)  ->  df, by least squares on strikes away from F.
+    F = float(next(iter(cn.values()))[1]["option_pricing"]["f"])
+    pts = [(F - k, float(c["M"]) - float(p["M"])) for k, (_, c, p) in cn.items() if abs(F - k) > 0.05 * S]
+    df_marks = sum(x * y for x, y in pts) / sum(x * x for x, _ in pts)
+    r_marks = -math.log(df_marks) / T
+
+    fin, roll = [], []
+    for m in TARGET_MONEYNESS:
+        K = _nearest(cn, m * S)
+        if any(r["strike"] == K for r in fin):
+            continue
+        base, c, p = cn[K]
+        cm, pm, ca, pb = float(c["M"]), float(p["M"]), _px(c, "a"), _px(p, "b")
+        prem_m = cm - pm
+        prem_x = ca - pb if ca is not None and pb is not None else None
+        row = {"strike": K, "moneyness": K / S, "premium_pct": prem_m / S,
+               "fwd_apr_mark": (K + prem_m - S) / S / T,
+               "fwd_apr_exec": (K + prem_x - S) / S / T if prem_x is not None else None, "by_lev": {}}
+        for L in leverage:
+            eq = 1 / L
+            borrow, used = max(prem_m / S - eq, 0.0), min(max(prem_m / S, 0.0), eq)
+            interest = rb * borrow + rs * used  # APR on notional: USDC borrowed + equity no longer earning supply
+            row["by_lev"][L] = {"borrow_pct": borrow, "interest_apr": interest,
+                                "total_apr": row["fwd_apr_mark"] + interest}
+        fin.append(row)
+
+        # Roll legs, per unit of notional
+        open_x = ((ca - cm) + (pm - pb)) / S if prem_x is not None else None
+        open_fee_t = (fee(o_taker, cm) + fee(o_taker, pm)) / S
+        open_fee_m = (fee(o_maker, cm) + fee(o_maker, pm)) / S
+        close_x = close_fee_t = close_fee_m = None
+        if co:
+            Ko = _nearest(co, m * S)
+            _, oc, op = co[Ko]
+            ocm, opm, ocb, opa = float(oc["M"]), float(op["M"]), _px(oc, "b"), _px(op, "a")
+            if abs(Ko / S - m) < 0.03:
+                close_fee_t = (fee(o_taker, ocm) + fee(o_taker, opm)) / S
+                close_fee_m = (fee(o_maker, ocm) + fee(o_maker, opm)) / S
+                if ocb is not None and opa is not None and ocb > 0.5 * ocm:  # a real two-sided book
+                    close_x = ((ocm - ocb) + (opa - opm)) / S
+        roll.append({"strike": K, "moneyness": K / S, "open_cross": open_x, "open_fee_taker": open_fee_t,
+                     "open_fee_maker": open_fee_m, "close_cross": close_x, "close_fee_taker": close_fee_t,
+                     "close_fee_maker": close_fee_m})
+
+    perp_rt_taker = (pask - pbid) / S + 2 * p_taker
+    perp_rt_maker = 2 * p_maker
+    # Margin of each roll path, as % of the position's notional (PM2 simulation).
+    n = notional / S
+    Kn = _nearest(cn, S)
+    bn, c, p = cn[Kn]
+    v_new = n * (float(c["M"]) - float(p["M"]))
+    im_new, mm_new = _margin_pct(api, ccy, [(bn + "-C", n), (bn + "-P", -n), (f"{ccy}-PERP", -n)], v_new, notional)
+    bridge = None
+    if co:
+        Ko = _nearest(co, S)
+        bo, oc, op = co[Ko]
+        v_old = n * (float(oc["M"]) - float(op["M"]))
+        bridge = _margin_pct(api, ccy, [(bo + "-C", n), (bo + "-P", -n), (bn + "-C", n), (bn + "-P", -n),
+                                        (f"{ccy}-PERP", -2 * n)], v_old + v_new, notional)
+    naked = _margin_pct(api, ccy, [(f"{ccy}-PERP", -n)], 0.0, notional)
+    rfq = rfq_synthetic_stats(api, ccy, now, rfq_days) if rfq_days > 0 else {}
+    return {"currency": ccy, "index": S, "new_expiry": utc(new).strftime("%Y%m%d"), "days": T * 365,
+            "near_expiry": utc(near[0]).strftime("%Y%m%d") if near else None,
+            "near_days": (near[0] - now) / 86400 if near else None,
+            "forward_apr": (F / S - 1) / T, "marks_discount_apr": r_marks, "usdc_borrow": rb, "usdc_supply": rs,
+            "financing": fin, "roll": roll, "perp_rt_taker": perp_rt_taker, "perp_rt_maker": perp_rt_maker,
+            "im_new": im_new, "mm_new": mm_new, "bridge_im_mm": bridge, "naked_perp_im_mm": naked, "rfq": rfq}
+
+
+def print_breakdown(bds: list[dict[str, Any]], leverage: list[float], notional: float, rfq_days: int) -> None:
+    def bp(x: Optional[float]) -> str:
+        return "   n/a" if x is None else f"{x * 1e4:6.1f}"
+
+    print("=" * 96)
+    print(f"BREAKDOWN  {utc(time.time()):%Y-%m-%d %H:%M} UTC   per ${notional:,.0f} notional; APR = % per year of notional")
+    print("=" * 96)
+    for b in bds:
+        print(f"\n{b['currency']}: index {b['index']:,.2f} | new monthly {b['new_expiry']} ({b['days']:.1f}d), forward "
+              f"{b['forward_apr'] * 100:.2f}% APR | option marks discount prepaid premium at {b['marks_discount_apr'] * 100:.2f}%"
+              f" | USDC borrow {b['usdc_borrow'] * 100:.2f}% / supply {b['usdc_supply'] * 100:.2f}%")
+        print("  1) Financing of the long forward by strike (premium prepaid in USDC; equity = 1/leverage in USDC)")
+        hdr = f"     {'strike':>9} {'K/S':>5} {'prepaid':>8} {'fwd@mark':>9} {'fwd@exec':>9}"
+        for L in leverage:
+            hdr += f" | {f'{L:g}x borrow':>12} {'$borrowed':>10} {'interest':>8} {'TOTAL':>7}"
+        print(hdr)
+        for r in b["financing"]:
+            line = (f"     {r['strike']:>9,.0f} {r['moneyness']:>5.2f} {r['premium_pct'] * 100:>7.1f}% "
+                    f"{r['fwd_apr_mark'] * 100:>8.2f}% " + (f"{r['fwd_apr_exec'] * 100:>8.2f}%" if r["fwd_apr_exec"] is not None
+                                                             else f"{'n/a':>9}"))
+            for L in leverage:
+                x = r["by_lev"][L]
+                line += (f" | {x['borrow_pct'] * 100:>11.1f}% {x['borrow_pct'] * notional:>10,.0f} "
+                         f"{x['interest_apr'] * 100:>7.2f}% {x['total_apr'] * 100:>6.2f}%")
+            print(line)
+        print(f"  2) Roll cost per monthly roll, bp of notional (x12 = APR). Old monthly near expiry proxied by "
+              f"{b['near_expiry']} ({(b['near_days'] or 0):.1f}d)")
+        print(f"     {'strike':>9} {'K/S':>5} | {'open new':>8} {'+fees':>6} | {'close old':>9} {'+fees':>6} |"
+              f" {'2-way':>6} {'3-way':>6} {'expire+bridge':>13} | maker: {'2-way':>6} {'3-way':>6} {'bridge':>6}")
+        for r in b["roll"]:
+            o = None if r["open_cross"] is None else r["open_cross"] + r["open_fee_taker"]
+            c = None if r["close_cross"] is None else r["close_cross"] + r["close_fee_taker"]
+            two = None if o is None or c is None else o + c
+            three = None if two is None else two + b["perp_rt_taker"]
+            brg = None if o is None else o + b["perp_rt_taker"]
+            m2 = None if r["close_fee_maker"] is None else r["open_fee_maker"] + r["close_fee_maker"]
+            m3 = None if m2 is None else m2 + b["perp_rt_maker"]
+            mb = r["open_fee_maker"] + b["perp_rt_maker"]
+            print(f"     {r['strike']:>9,.0f} {r['moneyness']:>5.2f} | {bp(r['open_cross']):>8} {bp(r['open_fee_taker']):>6} |"
+                  f" {bp(r['close_cross']) if r['close_cross'] is not None else ('no book' if r['close_fee_taker'] is not None else 'n/a'):>9}"
+                  f" {bp(r['close_fee_taker']):>6} | {bp(two):>6} {bp(three):>6} {bp(brg):>13} |"
+                  f"        {bp(m2):>6} {bp(m3):>6} {bp(mb):>6}")
+        print(f"     perp round trip: taker {b['perp_rt_taker'] * 1e4:.1f}bp, maker {b['perp_rt_maker'] * 1e4:.1f}bp")
+        im_b = b["bridge_im_mm"]
+        print(f"  3) Margin by roll path (PM2, % of notional): normal book IM {b['im_new'] * 100:.2f}% / MM {b['mm_new'] * 100:.2f}%"
+              + (f" | expire+bridge (old + new synth, 2x perp) IM {im_b[0] * 100:.2f}% / MM {im_b[1] * 100:.2f}%" if im_b else "")
+              + f" | naked perp after settlement IM {b['naked_perp_im_mm'][0] * 100:.1f}% / MM {b['naked_perp_im_mm'][1] * 100:.1f}%")
+        if im_b:
+            need = "  ".join(f"{L:g}x needs +{max(im_b[0] - 1 / L, 0) * notional:,.0f} USDC" for L in leverage)
+            print(f"     expire+bridge extra collateral for the hours around expiry: {need}")
+        if b["rfq"]:
+            print(f"  4) Public RFQ fills, last {rfq_days}d (2-leg synthetics, median net vs mark, before fees): " + "; ".join(
+                f"{k}: {v[2] * 1e4:+.1f}bp (n={v[0]}, ${v[1] / 1e6:.1f}m)" for k, v in sorted(b["rfq"].items())))
     print()
 
 
@@ -516,6 +768,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--leverage", nargs="+", type=float, default=[20, 25, 30], help="Notional / equity to evaluate.")
     ap.add_argument("--notional", type=float, default=1_000_000, help="USD notional for the margin simulation.")
     ap.add_argument("--fee-rate", type=float, default=0.0003, help="Option taker fee rate (of index) per leg.")
+    ap.add_argument("--breakdown", action="store_true",
+                    help="Financing by strike incl. the USDC borrow, and roll cost by method (2-way, 3-way, expire+bridge).")
+    ap.add_argument("--rfq-days", type=int, default=14, help="With --breakdown: days of public RFQ fills to measure (0 = skip).")
     ap.add_argument("--history", action="store_true", help="Replay every past monthly roll (Derive Chain archive).")
     ap.add_argument("--path", action="store_true", help="With --history: daily samples for MtM/margin replay (slow).")
     ap.add_argument("--cache", default="roll_history_cache.json", help="Raw chain sample cache (git-ignored).")
@@ -528,6 +783,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     snaps = {c: live(api, c, now, args.notional, args.fee_rate) for c in args.currencies}
     print_live(list(snaps.values()), args.leverage)
     out: dict[str, Any] = {"live": snaps}
+
+    if args.breakdown:
+        bds = [breakdown(api, c, now, args.leverage, args.notional, usdc_rates(api, c), args.rfq_days)
+               for c in args.currencies]
+        print_breakdown(bds, args.leverage, args.notional, args.rfq_days)
+        out["breakdown"] = bds
 
     if args.history:
         chain = Chain(args.rpc)

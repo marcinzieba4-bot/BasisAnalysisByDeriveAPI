@@ -81,7 +81,30 @@ leverage. The public RPC is rate-limited to about 6 calls/s, so `--history`
 takes a couple of minutes and `--path` about 25 minutes the first time. Raw
 samples are cached in `roll_history_cache.json`.
 
+`--breakdown` itemises what the long forward costs, per $ notional:
+
+- **financing by strike**: the forward premium at mark and executable, the
+  premium prepaid for an ITM call, the USDC borrowed to pay it at each
+  leverage, and that interest (borrow APY plus the supply APY the equity no
+  longer earns), giving a total. Option marks discount prepaid premium at
+  ~3.5–4%, below Derive's USDC borrow rate, so deep-ITM strikes do not lower
+  financing;
+- **roll cost by method**:
+  - 2-way: close the old synthetic and open the new one, keeping the perp;
+  - 3-way: close and reopen the call, put and perp;
+  - expire + perp bridge: the old synthetic settles while an extra short perp
+    hedges it.
+
+  Each is costed as screen taker and as maker. The close is costed on a 1–3
+  day expiry at the same moneyness, where strikes below ~0.9× index have no
+  two-sided book;
+- **margin of each path** (PM2): the bridge needs roughly twice the normal
+  initial margin for the hours around expiry. A perp left naked after
+  settlement needs ~15% (BTC) / ~17% (ETH);
+- **public RFQ fills** of 2-leg synthetics over the last `--rfq-days`.
+
 ```bash
 python3 roll_compare.py                                   # live snapshot
+python3 roll_compare.py --breakdown --leverage 20 25      # financing + roll costs
 python3 roll_compare.py --history --path --leverage 20 25 30
 ```
