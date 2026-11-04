@@ -53,3 +53,35 @@ Headers on each authenticated request:
 
 If your account uses a different signing scheme, the script surfaces the raw
 API error so it can be adjusted.
+
+## BTC vs ETH for the monthly roll (`roll_compare.py`)
+
+For the levered basis trade, a synthetic long forward (buy call + sell put,
+same strike, monthly expiry) against a short perp, this compares the
+underlyings on what decides the trade. It uses public data only (no key) and
+the Derive **v3** API (`https://api.derive.xyz/v3`):
+
+- the implied financing of the next monthly expiries (option forward vs index),
+  at mark and at the executable top of book for the synthetic, plus fees;
+- perp funding now / 7d / 30d, and how often it sits at the 10.95% APR anchor,
+  below it, or negative. Derive funding is a premium term plus a static
+  0.00125%/h. A balanced perp pays shorts exactly 10.95% APR, while one at a
+  discount pays less or turns negative;
+- PM2 margin for the hedged book (public `get_margin` simulation): maximum
+  leverage at initial margin and leverage at liquidation;
+- the carry and return on equity at the leverage you pass.
+
+`--history` replays every monthly roll since launch from Derive Chain archive
+state: the option forward feed, the perp's `aggregatedFunding`, the spot and
+perp feeds, and settlement prices. The chain stopped settling at the v3 cutover,
+but `https://rpc.derive.xyz` still serves historical state. After the cutover,
+funding comes from the v3 funding history. `--path` adds a sample every day
+inside each window to replay mark-to-market and maintenance margin at each
+leverage. The public RPC is rate-limited to about 6 calls/s, so `--history`
+takes a couple of minutes and `--path` about 25 minutes the first time. Raw
+samples are cached in `roll_history_cache.json`.
+
+```bash
+python3 roll_compare.py                                   # live snapshot
+python3 roll_compare.py --history --path --leverage 20 25 30
+```
