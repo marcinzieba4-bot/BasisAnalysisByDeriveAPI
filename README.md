@@ -69,7 +69,12 @@ the Derive **v3** API (`https://api.derive.xyz/v3`):
   discount pays less or turns negative;
 - PM2 margin for the hedged book (public `get_margin` simulation): maximum
   leverage at initial margin and leverage at liquidation;
-- the carry and return on equity at the leverage you pass.
+- the carry and return on equity at the leverage you pass;
+- a GO / NO-GO roll gate per currency, from 7-day funding and the share of
+  hours at the anchor. Defaults are BTC ≥ 8% and 70%, ETH ≥ 9.5% and 80%;
+  override them with `--gate BTC=8:70 ETH=9.5:80`. It also says whether ETH's
+  net carry beats BTC's by at least 1 point. Net carry here uses screen-taker
+  roll costs, so it is conservative next to RFQ execution.
 
 `--history` replays every monthly roll since launch from Derive Chain archive
 state: the option forward feed, the perp's `aggregatedFunding`, the spot and

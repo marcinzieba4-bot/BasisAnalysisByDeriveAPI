@@ -68,6 +68,9 @@ ANCHOR = 0.0000125  # static interest rate per hour: 10.95% APR
 HOURS = 24 * 365
 MIN_MONEYNESS = 0.9  # lowest strike / index considered liquid enough to close at the next roll
 FEE_CAP = 0.125  # option fee is capped at 12.5% of the option price
+# Roll gate: (min 7-day mean funding APR, min share of the last 7 days' hours at the anchor).
+GATE_DEFAULT = {"BTC": (0.08, 0.70), "ETH": (0.095, 0.80)}
+ETH_EDGE_OVER_BTC = 0.01  # ETH must beat BTC's net carry by this much to be worth its extra margin and thinner books
 CUTOVER = int(datetime(2026, 10, 6, 17, 40, tzinfo=timezone.utc).timestamp())  # last v2 funding update
 FIRST_ROLL = int(datetime(2023, 12, 29, 8, tzinfo=timezone.utc).timestamp())
 BLOCK_REF = (46881370, 1793784355)  # Derive Chain block <-> unix time; blocks are exactly 2 s apart
@@ -280,6 +283,27 @@ def live(api: Derive, ccy: str, now: float, notional: float, fee_rate: float) ->
     return {"currency": ccy, "index": S, "perp_mark": mark, "perp_premium": mark / S - 1,
             "funding_now_apr": f_now * HOURS, "funding_7d": funding_stats(rates[-168:]),
             "funding_30d": funding_stats(rates), "quotes": quotes, "margins": margins}
+
+
+def print_gate(snaps: list[dict[str, Any]], gate: dict[str, tuple[float, float]]) -> None:
+    """GO / NO-GO per currency for the next roll, and whether ETH beats BTC by enough."""
+    net = {}
+    print("ROLL GATE (7-day funding and share of hours at the 10.95% anchor; net carry = 7d funding - implied - roll cost)")
+    for s in snaps:
+        ccy, f7 = s["currency"], s["funding_7d"]
+        min_f, min_a = gate.get(ccy, (0.08, 0.70))
+        q = min((q for q in s["quotes"] if q.get("best")), key=lambda q: abs(q["days"] - 28), default=None)
+        if q:
+            net[ccy] = f7["mean_apr"] - q["implied_exec_apr"]
+        ok = f7["mean_apr"] >= min_f and f7["at_anchor"] >= min_a
+        print(f"  {ccy}: 7d funding {f7['mean_apr'] * 100:.2f}% (needs >= {min_f * 100:.1f}%), at anchor "
+              f"{f7['at_anchor'] * 100:.0f}% (needs >= {min_a * 100:.0f}%), negative {f7['negative'] * 100:.0f}% of hours"
+              + (f", net carry {net[ccy] * 100:+.2f}%" if ccy in net else "") + f"  ->  {'GO' if ok else 'NO-GO'}")
+    if "BTC" in net and "ETH" in net:
+        edge = net["ETH"] - net["BTC"]
+        print(f"  ETH vs BTC net carry: {edge * 100:+.2f} pts (ETH needs >= +{ETH_EDGE_OVER_BTC * 100:.1f}) -> "
+              f"{'ETH worth running' if edge >= ETH_EDGE_OVER_BTC else 'prefer BTC'}")
+    print()
 
 
 def print_live(snaps: list[dict[str, Any]], leverage: list[float]) -> None:
@@ -765,6 +789,8 @@ def print_history(res: dict[str, list[dict[str, Any]]], snaps: dict[str, dict[st
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="BTC vs ETH: monthly synthetic forward vs short perp on Derive.")
     ap.add_argument("--currencies", nargs="+", default=["BTC", "ETH"])
+    ap.add_argument("--gate", nargs="*", default=[], metavar="CCY=FUND:ANCHOR",
+                    help="Roll gate overrides in %%, e.g. BTC=8:70 ETH=9.5:80 (min 7d funding APR : min %% hours at anchor).")
     ap.add_argument("--leverage", nargs="+", type=float, default=[20, 25, 30], help="Notional / equity to evaluate.")
     ap.add_argument("--notional", type=float, default=1_000_000, help="USD notional for the margin simulation.")
     ap.add_argument("--fee-rate", type=float, default=0.0003, help="Option taker fee rate (of index) per leg.")
@@ -782,6 +808,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     api, now = Derive(args.api), time.time()
     snaps = {c: live(api, c, now, args.notional, args.fee_rate) for c in args.currencies}
     print_live(list(snaps.values()), args.leverage)
+    gate = dict(GATE_DEFAULT)
+    for g in args.gate:
+        ccy, _, v = g.partition("=")
+        f, _, a = v.partition(":")
+        gate[ccy.upper()] = (float(f) / 100, float(a) / 100)
+    print_gate(list(snaps.values()), gate)
     out: dict[str, Any] = {"live": snaps}
 
     if args.breakdown:
