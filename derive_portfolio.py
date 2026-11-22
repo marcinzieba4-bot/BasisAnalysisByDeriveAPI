@@ -3,12 +3,13 @@
 
 Why this exists
 ---------------
-Derive's REST API (https://api.lyra.finance) geo/WAF-blocks some regions
-(a US egress currently gets HTTP 503 from Cloudflare). Run this from a
-region that is not blocked (e.g. an EU EC2 box) and it will authenticate,
-pull the full portfolio for a subaccount, and print a readable summary plus
+Authenticates against Derive's v3 REST API (https://api.derive.xyz/v3),
+pulls the full portfolio for a subaccount, and prints a readable summary plus
 a machine-readable JSON blob (positions, balances, equity, net delta, and a
 funding/basis view for perps).
+
+The legacy host https://api.lyra.finance is dead (Cloudflare 521/503 from
+every region we tried); the v3 host is not geo-blocked.
 
 Credential handling
 -------------------
@@ -51,10 +52,11 @@ import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
-BASE_URL_DEFAULT = "https://api.lyra.finance"
+BASE_URL_DEFAULT = "https://api.derive.xyz/v3"
 HEX_KEY_RE = re.compile(r"^(0x)?[0-9a-fA-F]{64}$")
 CANDIDATE_KEY_VARS = [
     "DERIVE_API",
+    "DERIVE_4842_API",
     "DERIVE_PRIVATE_KEY",
     "DERIVE_SESSION_KEY",
     "DERIVE_API_KEY",
@@ -128,7 +130,7 @@ class DeriveClient:
         self.base_url = base_url.rstrip("/")
         self.acct = Account.from_key(private_key)
         self.signer = self.acct.address
-        # Owner wallet used in the X-LyraWallet header. Defaults to signer
+        # Owner wallet used in the X-DeriveWallet header. Defaults to signer
         # (works when the signer *is* the owner EOA); override with --wallet
         # when a separate session key signs on behalf of the owner.
         self.wallet = wallet or self.signer
@@ -140,17 +142,18 @@ class DeriveClient:
         sig = self.acct.sign_message(encode_defunct(text=ts)).signature.hex()
         if not sig.startswith("0x"):
             sig = "0x" + sig
-        return {"X-LyraWallet": self.wallet, "X-LyraTimestamp": ts, "X-LyraSignature": sig}
+        return {"X-DeriveWallet": self.wallet, "X-DeriveTimestamp": ts, "X-DeriveSignature": sig}
 
     def post(self, path: str, body: dict[str, Any], auth: bool = True) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
         headers = self._auth_headers() if auth else {}
         r = self.session.post(url, data=json.dumps(body), headers=headers, timeout=30)
         text = r.text
-        if r.status_code == 503 and "cloudflare" in text.lower():
+        if r.status_code in (503, 521, 530) and "cloudflare" in (text.lower() + str(r.headers).lower()):
             raise SystemExit(
-                f"HTTP 503 from Cloudflare on {path}. This egress is still geo/WAF "
-                "blocked by Derive — run this from an unblocked region (EU EC2)."
+                f"HTTP {r.status_code} from Cloudflare on {path}. Check --base-url "
+                f"(currently {self.base_url}); the legacy api.lyra.finance host is dead, "
+                "use https://api.derive.xyz/v3."
             )
         try:
             data = r.json()
@@ -178,23 +181,41 @@ def annualised_funding(hourly_rate: float) -> float:
     return hourly_rate * 24 * 365
 
 
+# Collateral assets whose USD value moves with an underlying we hedge with
+# perps/options. Their delta (in units of the underlying) is mark_value / index.
+COLLATERAL_UNDERLYING = {
+    "ETH": "ETH", "WETH": "ETH", "STETH": "ETH", "WSTETH": "ETH", "WEETH": "ETH", "RSETH": "ETH",
+    "BTC": "BTC", "WBTC": "BTC", "CBBTC": "BTC", "LBTC": "BTC", "TBTC": "BTC",
+}
+
+
 def analyse(subaccount: dict[str, Any], tickers: dict[str, Any]) -> dict[str, Any]:
     positions = subaccount.get("positions", []) or []
     collaterals = subaccount.get("collaterals", []) or []
 
     equity = _f(subaccount.get("subaccount_value"))
-    net_delta = 0.0
+    net_delta: dict[str, float] = {}
+    index_by_ccy: dict[str, float] = {}
     gross_notional = 0.0
     perp_rows, option_rows, collateral_rows = [], [], []
 
+    for p in positions:
+        idx = _f(p.get("index_price"))
+        if idx:
+            index_by_ccy.setdefault(p.get("instrument_name", "").split("-")[0], idx)
+
     for c in collaterals:
+        usd = _f(c.get("mark_value"))
         collateral_rows.append(
             {
                 "asset": c.get("asset_name"),
                 "amount": _f(c.get("amount")),
-                "usd_value": _f(c.get("mark_value")),
+                "usd_value": usd,
             }
         )
+        ccy = COLLATERAL_UNDERLYING.get(str(c.get("asset_name", "")).upper())
+        if ccy and index_by_ccy.get(ccy):
+            net_delta[ccy] = net_delta.get(ccy, 0.0) + usd / index_by_ccy[ccy]
 
     for p in positions:
         name = p.get("instrument_name", "")
@@ -205,11 +226,14 @@ def analyse(subaccount: dict[str, Any], tickers: dict[str, Any]) -> dict[str, An
         upnl = _f(p.get("unrealized_pnl"))
         notional = abs(amount) * (mark or idx)
         gross_notional += notional
-        net_delta += delta if delta else amount  # options carry delta; perps delta≈amount
+        # `delta` is per contract (1.0 for perps), so scale by position size.
+        ccy = name.split("-")[0]
+        net_delta[ccy] = net_delta.get(ccy, 0.0) + (delta if delta else 1.0) * amount
 
         tk = tickers.get(name, {})
         if name.endswith("-PERP") or p.get("instrument_type") == "perp":
-            hourly = _f(tk.get("funding_rate") or (tk.get("perp_details") or {}).get("funding_rate"))
+            # v3 tickers use compact keys: "f" = hourly funding rate.
+            hourly = _f(tk.get("f") or tk.get("funding_rate") or (tk.get("perp_details") or {}).get("funding_rate"))
             basis = ((mark - idx) / idx) if idx else 0.0
             perp_rows.append(
                 {
@@ -238,7 +262,7 @@ def analyse(subaccount: dict[str, Any], tickers: dict[str, Any]) -> dict[str, An
 
     return {
         "equity_usd": round(equity, 2),
-        "net_delta": round(net_delta, 4),
+        "net_delta": {k: round(v, 4) for k, v in net_delta.items()},
         "gross_notional_usd": round(gross_notional, 2),
         "num_positions": len(positions),
         "perps": perp_rows,
@@ -254,7 +278,8 @@ def print_summary(wallet: str, sub_id: int, a: dict[str, Any]) -> None:
     print(f"Snapshot: {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
     print(line)
     print(f"Equity (subaccount value): ${a['equity_usd']:,.2f}")
-    print(f"Net delta: {a['net_delta']}   Gross notional: ${a['gross_notional_usd']:,.2f}")
+    deltas = ", ".join(f"{k} {v:+.3f}" for k, v in a["net_delta"].items()) or "n/a"
+    print(f"Net delta (incl. collateral): {deltas}   Gross notional: ${a['gross_notional_usd']:,.2f}")
     print(f"Positions: {a['num_positions']}")
     if a["collaterals"]:
         print("\nCollaterals:")
@@ -283,7 +308,7 @@ def print_summary(wallet: str, sub_id: int, a: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Fetch & analyse a Derive subaccount.")
-    ap.add_argument("--wallet", help="Owner wallet address (X-LyraWallet header).")
+    ap.add_argument("--wallet", help="Owner wallet address (X-DeriveWallet header).")
     ap.add_argument("--subaccount", type=int, help="Subaccount id, e.g. 65812.")
     ap.add_argument("--key-env", help="Name of env var holding the session private key.")
     ap.add_argument("--scan-env", action="store_true", help="Scan env for a key-shaped value.")
