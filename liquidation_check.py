@@ -338,6 +338,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--settle-expiry", nargs="*", default=[], metavar="YYYYMMDD",
                     help="Settle all legs of these expiries at today's forward first.")
     ap.add_argument("--fill", choices=["mark", "touch"], default="mark")
+    ap.add_argument("--deposit", type=float, default=0.0, help="What-if USDC deposit (negative = withdraw).")
     ap.add_argument("--base-url", default=BASE_URL_DEFAULT)
     args = ap.parse_args(argv)
 
@@ -368,7 +369,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             pf.trade_option(name, q)
             pf.usdc(-cost)
-    whatif = bool(args.trade or args.settle_expiry)
+    if args.deposit:
+        st.coll.setdefault("USDC", [0.0, 1.0])[0] += args.deposit
+        st.mtm += args.deposit
+        pf.usdc(args.deposit)
+    whatif = bool(args.trade or args.settle_expiry or args.deposit)
     engine_mm = None
     if whatif:
         req = pf.request(type("B", (), {"watch": watch})())
@@ -381,7 +386,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print(f"Derive MM now ${derive_mm:,.0f} | model MM now ${model_now:,.0f} "
           f"(model error {model_now - derive_mm:+,.0f})")
     if whatif:
-        print(f"What-if: settle {args.settle_expiry or '-'}; trades {args.trade or '-'} (fill={args.fill})")
+        print(f"What-if: settle {args.settle_expiry or '-'}; trades {args.trade or '-'} (fill={args.fill}); "
+              f"deposit {args.deposit:+,.0f} USDC")
         print(f"  Derive engine MM after what-if ${engine_mm:,.0f} | model ${bd['mm']:,.0f}")
     for ccy, b in bd["ccy"].items():
         print(f"  {ccy}: maxLoss {b['max_loss']:,.0f} (regular {b['regular']:,.0f}, tail {b['tail']:,.0f}, "
