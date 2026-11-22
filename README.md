@@ -97,6 +97,24 @@ more than `mark` suggests.
 
 The script never places, cancels or changes anything.
 
+## Liquidation price (`liquidation_check.py`)
+
+Derive's margin simulator only prices a portfolio at today's spot. This script
+rebuilds the documented portfolio-margin (PM2) maintenance margin (23-scenario
+grid, tail ladder, skew rails, forward loss, contingencies, collateral
+haircuts). On the books tested it matches Derive's live MM to within about $75.
+It then moves spot and solves for MM = 0: ETH and BTC together, and each alone.
+What-ifs are applied first and also checked with the exact engine at today's prices.
+
+```bash
+python3 liquidation_check.py --subaccount 12345
+python3 liquidation_check.py --subaccount 12345 --trade ETH-20270129-1400-P=-40
+python3 liquidation_check.py --subaccount 12345 --settle-expiry 20261127 \
+    --trade ETH-20270129-1600-C=165.65 ETH-20270129-1600-P=-165.65
+```
+
+Moves are instant, forwards move 1:1 with spot, and implied vols stay sticky by strike.
+
 ## Auth scheme reference
 
 Headers on each authenticated request (v3):
