@@ -126,10 +126,12 @@ def discover_key(key_env: Optional[str], scan_env: bool) -> tuple[str, str, str]
 # Signed REST client
 # --------------------------------------------------------------------------- #
 class DeriveClient:
-    def __init__(self, private_key: str, wallet: Optional[str], base_url: str):
+    """Signed client. Pass private_key=None for public endpoints only."""
+
+    def __init__(self, private_key: Optional[str], wallet: Optional[str], base_url: str):
         self.base_url = base_url.rstrip("/")
-        self.acct = Account.from_key(private_key)
-        self.signer = self.acct.address
+        self.acct = Account.from_key(private_key) if private_key else None
+        self.signer = self.acct.address if self.acct else None
         # Owner wallet used in the X-DeriveWallet header. Defaults to signer
         # (works when the signer *is* the owner EOA); override with --wallet
         # when a separate session key signs on behalf of the owner.
@@ -138,6 +140,8 @@ class DeriveClient:
         self.session.headers.update({"accept": "application/json", "content-type": "application/json"})
 
     def _auth_headers(self) -> dict[str, str]:
+        if self.acct is None or not self.wallet:
+            raise SystemExit("this endpoint needs a session key and wallet (--key-env / --wallet)")
         ts = str(int(time.time() * 1000))
         sig = self.acct.sign_message(encode_defunct(text=ts)).signature.hex()
         if not sig.startswith("0x"):
@@ -186,6 +190,8 @@ def annualised_funding(hourly_rate: float) -> float:
 COLLATERAL_UNDERLYING = {
     "ETH": "ETH", "WETH": "ETH", "STETH": "ETH", "WSTETH": "ETH", "WEETH": "ETH", "RSETH": "ETH",
     "BTC": "BTC", "WBTC": "BTC", "CBBTC": "BTC", "LBTC": "BTC", "TBTC": "BTC",
+    "SOL": "SOL", "JITOSOL": "SOL", "MSOL": "SOL", "JUPSOL": "SOL",
+    "XAUT": "XAUT",
 }
 
 

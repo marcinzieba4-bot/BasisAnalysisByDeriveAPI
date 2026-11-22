@@ -46,37 +46,54 @@ the derived public address of each key-shaped value, never the key).
 
 ## Basis / carry projection (`basis_projection.py`)
 
-Projects the net P&L of a funding-carry book over a horizon (default 60 days):
+Projects the net P&L of funding-carry books over a horizon (default 60 days):
 long spot/LST collateral and synthetic long forwards (long call + short put)
-against a short perp that collects funding, financed with borrowed USDC.
+against short perps that collect funding, financed with borrowed USDC.
+
+Positions come from **public** endpoints (`public/margin_watch`), so no session
+key is needed and any subaccount, or every funded subaccount of a wallet, can
+be projected and totalled:
 
 ```bash
-python3 basis_projection.py --wallet 0xYourOwnerWallet --subaccount 12345 \
-  --key-env DERIVE_PRIVATE_KEY --days 60 --exec mid --json-out projection.json
+# every funded subaccount of a wallet
+python3 basis_projection.py --wallet 0xYourOwnerWallet --days 60
+
+# specific subaccounts (may span wallets)
+python3 basis_projection.py --subaccount 111 222 333 --exec mid --json-out projection.json
 ```
 
-It reports, per funding scenario (30d / 7d realised average, current rate,
-flat stress rates):
+It reports, per subaccount and in total, per funding scenario (30d / 7d
+realised average, current rate, flat stress rates):
 
 | Component  | Source                                                                 |
 |------------|------------------------------------------------------------------------|
 | funding    | perp size x spot x funding APR, hourly                                  |
-| staking    | Lido stETH APR on wstETH collateral                                     |
+| staking    | Lido stETH APR on wstETH; `--asset-apr JITOSOL=0.07` for others         |
 | interest   | USDC pool borrow/supply APY on the path-dependent cash balance          |
 | options    | Black-76 repricing at fixed IV: forward roll-down + theta of all legs   |
 | fees+spr   | exchange fees + execution vs mark when expiring legs are rolled         |
 
-It compares two ways of handling legs that expire inside the horizon: **roll**
-(re-open the expiring synthetic delta at the first expiry after the horizon)
-or **close** (buy back the same amount of perp). It also prints a spot-shock grid
-and asks Derive's read-only margin simulator (`private/get_margin`) what each
-choice does to maintenance margin right after the next expiry. A negative
-`maintenance_margin + projected_margin_change` means the subaccount becomes
-liquidatable when that expiry settles.
+Legs that expire inside the horizon are handled two ways: **roll** (re-open the
+expiring synthetic delta at the first expiry after the horizon) or **close**
+(buy back the same amount of perp). `--roll-size neutral` (default) re-hedges
+only what is needed to end delta-neutral; `full` replaces the whole expiring
+delta and keeps today's residual net delta.
+
+Around the next expiry it rebuilds the portfolio explicitly and asks
+`public/get_margin` for MM/IM after expiry with no action, after a roll, after
+closing perp, and for a single **calendar roll package** before expiry (close
+the expiring legs and open the new expiry in one trade). Negative MM means the
+subaccount becomes liquidatable when that expiry settles.
 
 `--exec mark|mid|touch` sets the roll execution price. Derive's option marks
 can sit off the order-book mid, so `touch` (crossing the book) can cost far
 more than `mark` suggests.
+
+> **Simulator caveat.** `private/get_margin` with `simulated_position_changes`
+> on a perp books the size change at the *existing* position's entry price,
+> which credits or debits a phantom `(mark - entry) x change`. Don't trust it
+> for perp changes. The explicit-portfolio `public/get_margin` used here
+> reproduces live MM/IM to within about $60.
 
 The script never places, cancels or changes anything.
 
