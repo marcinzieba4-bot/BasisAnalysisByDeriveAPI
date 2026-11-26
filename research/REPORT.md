@@ -196,6 +196,68 @@ Average surface (ATM IV): ETH ≈ 61% at 1M → 62% at 12M; BTC ≈ 47% at 1M �
 
 Reproduce: `python3 research/tenor_strike_backtest.py`. Full grids are in `output/tenor_strike_<COIN>_<funding>.csv`, and the surface diagnostics are in `output/surface_diag_<COIN>.csv`.
 
+## Short tenors: 1W / 2W / 4W (weekly grid)
+
+**Method:**
+- A short-dated IV surface is fitted every Friday to Deribit trades 08:00–11:00 UTC (3–45 days to expiry).
+- Each tenor/strike is calibrated to the average real taker-buy IV (`wing_check.py`). The fit was too cheap for 1W 10–15% OTM by up to 2.6 (ETH) and 5.4 (BTC) vol pts; 2W was within ±1 pt.
+- Purchases add +1 vol pt of spread (+3 as a sensitivity). Fees are Derive-style: 0.03% of spot, capped at 12.5% of premium.
+- Sizing is delta-matched to 40.
+- There are 48 start weeks (Nov-23 … Oct-24). A40 is rebalanced weekly.
+
+**Median excess CAGR vs A40, pp (share of 48 start weeks beating A40), Hyperliquid funding, +1 vol:**
+
+| | ETH ATM | ETH 5% | ETH 10% | ETH 15% | BTC ATM | BTC 5% | BTC 10% | BTC 15% |
+|---|---|---|---|---|---|---|---|---|
+| 1W | −11 (0%) | −8 (0%) | +22 (100%)† | +101 (100%)† | −8 (0%) | +1 (62%) | +51 (100%)† | +32 (100%)† |
+| 2W | +7 (100%) | +15 (100%) | +20 (88%) | +28 (100%)† | 0 (50%) | +4 (60%) | +9 (71%)† | +17 (71%)† |
+| 4W | +11 (100%) | +15 (100%) | +20 (100%) | +23 (100%) | +2 (58%) | +2 (62%) | +4 (65%) | +7 (69%) |
+
+† Lottery: reaching 40 delta needs 2.9–1,400 calls per unit, with worst-start drawdowns of −46% to −98%. On BTC, 1W 15% OTM was ruined at a +3 vol spread.
+
+**Worst start-week excess CAGR, pp:**
+
+| | 2W | 4W |
+|---|---|---|
+| ETH (ATM / 5 / 10%) | +0.2 / +3.6 / −0.9 | +3.6 / +9.3 / +14.1 |
+| BTC (ATM / 5%) | −7.8 / −6.5 | −4.4 / −8.0 |
+
+**Worst-start maxDD:**
+
+| | 2W | 4W | A40 |
+|---|---|---|---|
+| ETH (ATM / 5 / 10%) | −40 / −46 / −52% | −37 / −38 / −44% | −30% |
+| BTC (ATM / 5%) | −27 / −38% | −24 / −26% | −21% |
+
+**At a +3 vol spread:**
+
+| | ETH 2W | ETH 4W | BTC 2W | BTC 4W |
+|---|---|---|---|---|
+| share of starts beating A40 | 65–88% | 100% | 33–52% | 29–56% |
+
+**Premium per year, % of equity (ATM → 10%):**
+
+| | 2W | 4W |
+|---|---|---|
+| ETH | 97 → 76% | 70 → 56% |
+| BTC | 75 → 54% | 54 → 43% |
+
+**IV vs realised vol:**
+
+| | 1W | 2W | 4W |
+|---|---|---|---|
+| ETH | 60.2 vs 61.5 | 59.8 vs 62.4 | 59.0 vs 63.2 |
+| BTC | 45.6 vs 44.6 | 45.3 vs 45.1 | 44.8 vs 45.6 |
+
+There is no extra cheapness in short-dated vol.
+
+**Reading:**
+- 2W is not better than monthly. On ETH the median is the same at the same strike, but 2W has a worse worst case, deeper drawdowns, about 40% more premium per year, and is more fragile to spreads.
+- On BTC, 2W shows a slightly higher median at 5–10% OTM, but it beats A40 in only 60–71% of starts (about 50% at +3 vol) and has deeper drawdowns. 2–3M remains the robust BTC choice.
+- 1W ATM/5% lost to A40 in nearly every start.
+
+Reproduce: `python3 research/wing_check.py`, then `python3 research/weekly_backtest.py`. Full grids are in `output/weekly_<COIN>_<funding>.csv`.
+
 ## Today (26-Nov-2026 16:00 UTC)
 
 | | ETH | BTC |

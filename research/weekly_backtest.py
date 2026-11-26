@@ -78,6 +78,19 @@ def sim_A(S, f, i0, reinvest):
     return np.concatenate([[1.0], eq])
 
 
+BIAS: dict = {}
+
+
+def load_bias(cur):
+    """Per (tenor, strike) correction so purchases are priced at the average real
+    Deribit taker-buy IV (wing_check.py), not the smooth fit."""
+    path = os.path.join(OUT, f"wing_bias_{cur}.csv")
+    BIAS.clear()
+    if os.path.exists(path):
+        b = pd.read_csv(path)
+        BIAS.update({(int(r.t), round(float(r.otm), 2)): -float(r.fit_minus_buy) / 100 for r in b.itertuples()})
+
+
 def sim_B(grid, S, f, surf, i0, tenor, otm, reinvest, extra=0.01):
     N = len(grid)
     book, units, K, exp_date = 1.0, 0.0, None, None
@@ -103,7 +116,7 @@ def sim_B(grid, S, f, surf, i0, tenor, otm, reinvest, extra=0.01):
             K = S[i] * (1 + otm)
             n = H / sf.delta(K, tau, S[i])
             units = n * (book if reinvest else 1.0) / S[i]
-            px = sf.price(K, tau, S[i], extra)
+            px = sf.price(K, tau, S[i], extra + BIAS.get((tenor, round(otm, 2)), 0.0))
             cost = units * (px + fee_open(S[i], px))
             prem_rel += cost / book
             book -= cost
@@ -125,7 +138,8 @@ def main():
     report = {}
     for cur in ("ETH", "BTC"):
         grid, S, f, surf, rv = build(cur)
-        diag = {}
+        load_bias(cur)
+        diag = {"buy_iv_bias_added_volpts": {f"{k[0]}W/{int(k[1]*100)}%": round(v * 100, 1) for k, v in BIAS.items()}}
         for t in TENORS_W:
             ivs = [surf[g].iv(S[k], 7 * t / 365)[0] for k, g in enumerate(grid[:-t])]
             rvs = [float(np.sqrt(np.mean(rv[k:k + t] ** 2))) for k in range(len(grid) - t)]
@@ -165,8 +179,7 @@ def main():
     json.dump(report, open(os.path.join(OUT, "weekly.json"), "w"), indent=2, default=float)
 
     for cur, rep in report.items():
-        print(f"\n######## {cur}  weeks={rep['weeks']}  IV vs RV: "
-              f"{ {k: {kk: round(vv * 100, 1) for kk, vv in v.items()} for k, v in rep['iv_vs_rv'].items()} }")
+        print(f"\n######## {cur}  weeks={rep['weeks']}  diag: {json.dumps(rep['iv_vs_rv'], default=float)}")
         for src in ("hyperliquid", "deribit"):
             df = pd.DataFrame(rep[src])
             for extra in (0.01, 0.03):
