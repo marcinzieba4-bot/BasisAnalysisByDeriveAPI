@@ -80,6 +80,42 @@ Strike sensitivity (ATM / 5% / 10% OTM) is approximate, because it uses the 5%-O
 - ETH: B +90% / +126% / +141%
 - BTC: B +95% / +83% / +71%
 
+## Strike choice: ATM vs 5% OTM vs 10% OTM (each priced with its own real Deribit IV)
+
+On average the IV paid was almost the same at all three strikes: ETH ≈ 60.7%, BTC ≈ 46.3%. So any difference comes from the shape of the monthly moves, not from skew.
+
+**Delta-matched** (same 40 starting delta as A), compounded 3y:
+
+| | ATM (~73 calls) | 5% OTM (~95–103) | 10% OTM (~123–158) | A 40 unhedged |
+|---|---|---|---|---|
+| ETH, HL funding | +92% | +133% | **+183%** | +41% |
+| ETH, Deribit funding | +46% | +77% | **+115%** | +19% |
+| BTC, HL funding | **+89%** | +84% | +76% | +73% |
+| BTC, Deribit funding | +48% | +45% | +38% | **+50%** |
+| ETH payoff / premium | 1.22× | 1.38× | 1.58× | |
+| BTC payoff / premium | 1.18× | 1.21× | 1.24× | |
+| P(ATM beats 5% OTM), bootstrap 36m | ETH 0% · BTC 60% | | | |
+
+**Same count** (100 calls), HL funding:
+
+| | delta | premium / month | 3y reinvest | maxDD |
+|---|---|---|---|---|
+| ETH ATM | 0.55 | 7.4% | +89% | −44% |
+| ETH 5% OTM | 0.43 | 5.3% | +125% | −34% |
+| ETH 10% OTM | 0.33 | 3.7% | **+139%** | **−26%** |
+| BTC ATM | 0.54 | 5.8% | +93% | −31% |
+| BTC 5% OTM | 0.39 | 3.7% | +83% | −19% |
+| BTC 10% OTM | 0.27 | 2.3% | +69% | −17% |
+
+**Budget-matched BTC ATM** (≈62 ATM calls for the same monthly spend as 100 × 5% OTM): +89% (HL) / +48% (Deribit). It had the lowest drawdown of any BTC call variant (−16% / −18%).
+
+**Reading:**
+- **ETH:** further OTM was better. ETH's big months (+33%, +43%, +47%, +49%) reward convexity per premium dollar.
+- **BTC:** ATM is marginally better than 5% OTM. That comes from a smoother path, because BTC had many +6% to +13% months where only ATM pays. The edge per premium dollar is about the same at every strike, so BTC's strike choice is mostly noise.
+- **ATM at 100 calls** is about 55 delta, i.e. more exposure than A's 40, plus a much deeper drawdown.
+
+Reproduce: `python3 research/strike_compare.py`. Per-month detail is in `output/strike_monthly_<COIN>_<funding>.csv`.
+
 ## Today (26-Nov-2026 16:00 UTC)
 
 | | ETH | BTC |
