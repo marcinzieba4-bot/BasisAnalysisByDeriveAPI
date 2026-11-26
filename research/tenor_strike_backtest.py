@@ -101,7 +101,7 @@ class Surface:
         tau_c = min(max(tau, self.tau_lo), self.tau_hi)
         F = S * math.exp(self.carry(tau) * tau)
         x = math.log(K / F)
-        v = float(self._design(np.array([x]), np.array([math.log(tau_c)])) @ self.beta)
+        v = float((self._design(np.array([x]), np.array([math.log(tau_c)])) @ self.beta)[0])
         return min(max(v, 0.15), 2.5), F
 
     def price(self, K, tau, S=None, extra=0.0):
@@ -117,7 +117,8 @@ class Surface:
 
 def build(cur: str):
     spot_h, funds, dvol, _ = bt.load(cur)
-    tr = pd.read_csv(os.path.join(DATA, f"surface_{cur}.csv"), parse_dates=["date", "time", "expiry"])
+    tr = pd.read_csv(os.path.join(DATA, f"surface_{cur}.csv"), parse_dates=["time", "expiry"])
+    tr["date"] = pd.to_datetime(tr["date"], format="mixed")
     dates = sorted(d for d in tr["date"].unique() if pd.Timestamp(d) >= bt.FIRST_ROLL)
     now = spot_h.index[-1]
     grid = [pd.Timestamp(d) for d in dates if pd.Timestamp(d) < now - pd.Timedelta(days=5)] + [now]
@@ -158,7 +159,7 @@ def sim_B(grid, S, f, surf, i0, tenor, otm, reinvest, extra=0.01, n_fixed=None):
     units = 0.0
     K = expiry_i = None
     eq = [1.0]
-    prem_paid = payoff_got = 0.0
+    prem_paid = payoff_got = prem_rel = 0.0
     n_list = []
     i = i0
     next_roll = i0
@@ -183,6 +184,7 @@ def sim_B(grid, S, f, surf, i0, tenor, otm, reinvest, extra=0.01, n_fixed=None):
             notional = book if reinvest else 1.0
             units = n * notional / S[i]
             cost = units * (sf.price(K, tau, S[i], extra) + FEE * S[i])
+            prem_rel += cost / (book + 0.0)  # premium as fraction of equity at purchase
             book -= cost
             prem_paid += cost
             n_list.append(n)
@@ -198,7 +200,8 @@ def sim_B(grid, S, f, surf, i0, tenor, otm, reinvest, extra=0.01, n_fixed=None):
         else:
             V = 0.0
         eq.append(book + V)
-    return np.array(eq), prem_paid, payoff_got, float(np.mean(n_list)) if n_list else float("nan")
+    return (np.array(eq), prem_paid, payoff_got,
+            float(np.mean(n_list)) if n_list else float("nan"), prem_rel)
 
 
 def metrics(eq, years):
@@ -232,14 +235,12 @@ def main():
                 for tenor in TENORS:
                     for otm in STRIKES:
                         ph = []
-                        for p in range(tenor):
-                            if p >= len(grid) - 13:
-                                break
+                        for p in range(12):  # same 12 start months (Nov-23 .. Oct-24) for every tenor
                             years = yfrac(grid[p], grid[-1])
-                            eB, prem, pay, n = sim_B(grid, S, f[src], surf, p, tenor, otm, reinvest)
+                            eB, prem, pay, n, prel = sim_B(grid, S, f[src], surf, p, tenor, otm, reinvest)
                             eA = sim_A(S, f[src], p, reinvest)
                             mB, mA = metrics(eB, years), metrics(eA, years)
-                            ph.append(dict(phase=p, years=years, B=mB, A=mA, prem_py=prem / years,
+                            ph.append(dict(phase=p, years=years, B=mB, A=mA, prem_py=prel / years,
                                            payoff_over_prem=pay / prem if prem else float("nan"), n=n,
                                            excess_cagr=mB["cagr"] - mA["cagr"]))
                         p0 = ph[0]
@@ -266,20 +267,21 @@ def main():
         for src in ("hyperliquid", "deribit"):
             df = pd.DataFrame(rep[src])
             df = df[df["mode"] == "reinvest"]
-            print(f"--- {src} funding, reinvest. A40: total {df['A_total'].iloc[0]*100:+.0f}%  "
+            print(f"--- {src} funding, reinvest. A40 (start Nov-23): total {df['A_total'].iloc[0]*100:+.0f}%  "
                   f"CAGR {df['A_cagr'].iloc[0]*100:+.1f}%  maxDD {df['A_maxdd'].iloc[0]*100:.0f}%")
-            piv = df.pivot(index="tenor_m", columns="otm", values="B_total").mul(100).round(0)
-            print("B total (start Nov-23):\n", piv.to_string())
-            piv = df.pivot(index="tenor_m", columns="otm", values="excess_cagr_median").mul(100).round(1)
-            print("median excess CAGR vs A over all start months (pp):\n", piv.to_string())
-            piv = df.pivot(index="tenor_m", columns="otm", values="share_phases_B_beats_A").round(2)
-            print("share of start months B beats A:\n", piv.to_string())
-            piv = df.pivot(index="tenor_m", columns="otm", values="B_maxdd").mul(100).round(0)
-            print("B maxDD (start Nov-23):\n", piv.to_string())
-            piv = df.pivot(index="tenor_m", columns="otm", values="prem_per_year").mul(100).round(1)
-            print("premium paid per year, % of notional:\n", piv.to_string())
-            piv = df.pivot(index="tenor_m", columns="otm", values="payoff_over_prem").round(2)
-            print("payoff / premium:\n", piv.to_string())
+            for col, mul, nd, title in (
+                ("B_total", 100, 0, "B total, start Nov-23 (%)"),
+                ("excess_cagr_median", 100, 1, "median excess CAGR vs A40 over 12 start months (pp)"),
+                ("excess_cagr_min", 100, 1, "worst start month excess CAGR (pp)"),
+                ("share_phases_B_beats_A", 1, 2, "share of 12 start months B beats A40"),
+                ("B_maxdd_worst_phase", 100, 0, "B maxDD, worst start month (%)"),
+                ("avg_calls", 1, 2, "calls per unit (delta-matched to 40)"),
+                ("prem_per_year", 100, 1, "premium per year, % of equity"),
+                ("payoff_over_prem", 1, 2, "payoff / premium (start Nov-23)"),
+            ):
+                piv = df.pivot(index="tenor_m", columns="otm", values=col).mul(mul).round(nd)
+                piv.columns = [f"{int(c*100)}%" for c in piv.columns]
+                print(f"{title}:\n{piv.to_string()}")
 
 
 if __name__ == "__main__":

@@ -136,6 +136,66 @@ Results are 3y with reinvesting. "P boot" is the chance the calls beat A over 36
 
 Reproduce: `python3 research/atm_vs_perp.py`.
 
+## Tenor × strike grid: 1 / 2 / 3 / 6 / 9 / 12-month calls, ATM / 5 / 10 / 15% OTM
+
+**Method:**
+- At every month-end, an IV surface is fitted to all Deribit option trades of the next 24h: about 4k (ETH) and 8k (BTC) trades per date, fit error about 2.5 vol pts.
+- Calls are bought at surface IV + 1 vol pt, held to expiry, marked monthly, and re-bought.
+- Sizing is delta-matched to 40 unhedged.
+- Each strategy is run from 12 different start months (Nov-23 … Oct-24) and compared with A40 over the same window.
+- Funding is Hyperliquid (~15%). Deribit funding (~5–7%) gives the same ranking at lower levels.
+
+Average surface (ATM IV): ETH ≈ 61% at 1M → 62% at 12M; BTC ≈ 47% at 1M → 51% at 12M. Forward carry is about 7–8%/yr.
+
+**Median excess CAGR vs A40 over 12 start months, pp (share of starts in which B beat A40), reinvesting:**
+
+| tenor | ETH ATM | ETH 5% | ETH 10% | ETH 15% | BTC ATM | BTC 5% | BTC 10% | BTC 15% |
+|---|---|---|---|---|---|---|---|---|
+| 1M | +11 (100%) | +19 (100%) | +28 (100%) | +36 (100%) | +0 (58%) | −2 (33%) | −4 (25%) | +3 (75%)* |
+| 2M | +13 (100%) | +16 (100%) | +19 (100%) | +22 (100%) | +3 (92%) | **+5 (100%)** | +4 (92%) | +4 (58%) |
+| 3M | +12 (100%) | +14 (100%) | +14 (100%) | +13 (100%) | +3 (75%) | +3 (92%) | +3 (92%) | +4 (92%) |
+| 6M | −2 (50%) | −1 (50%) | 0 (50%) | 0 (50%) | −3 (17%) | −3 (17%) | −4 (0%) | −6 (0%) |
+| 9M | −8 (0%) | −9 (0%) | −9 (0%) | −10 (0%) | −2 (33%) | −2 (42%) | −2 (42%) | −2 (42%) |
+| 12M | −7 (0%) | −7 (8%) | −7 (8%) | −6 (8%) | −1 (42%) | 0 (58%) | 0 (58%) | 0 (50%) |
+
+\* BTC 1M 15% OTM needs about 2.7 calls per unit to reach 40 delta (ETH: 1.7). It is a tail-heavy, lottery-like result.
+
+**Premium per year, % of equity (ATM → 15% OTM):**
+
+| tenor | ETH | BTC |
+|---|---|---|
+| 1M | 65 → 49% | 51 → 36% |
+| 3M | 36 → 31% | 30 → 24% |
+| 12M | 18 → 16% | 15 → 14% |
+
+**Payoff / premium, start Nov-23:**
+
+| tenor | ETH | BTC |
+|---|---|---|
+| 1M | 1.09–1.46 | 1.01–1.20 |
+| 2–3M | 1.06–1.31 | 1.10–1.49 |
+| 6M | 0.6 | 0.9 |
+| 9M | 0.07–0.24 | 1.2 |
+| 12M | 0.55 | 1.2–1.35 |
+
+**Worst-start-month maxDD:**
+
+| tenor | ETH | BTC |
+|---|---|---|
+| 1–3M | −31 to −38% | −18 to −23% (except far-OTM 1M) |
+| 6–12M | −39 to −52% | −20 to −31% |
+| A40 | −30% | −19% |
+
+**Reading:**
+- Long-dated calls are 3–4× cheaper per year, but they lost.
+- In the last 3 years' violent round-trips, a 9–12M call bought near a high expired worthless or nearly so: ETH lost 45–93% of the premium.
+- Short tenors restrike every 1–3 months, so they bank each burst and reset.
+- Without reinvesting, BTC 12M looks better (it beats A40 in 58–67% of starts at ~15% basis), but it is still not as robust as 2–3M.
+- Caveat: a 3-year window holds only about 3 independent 12M outcomes.
+- Check that Derive lists the expiry you want; quarterlies cover 3M, and 6–12M may only be on Deribit.
+
+Reproduce: `python3 research/tenor_strike_backtest.py`. Full grids are in `output/tenor_strike_<COIN>_<funding>.csv`, and the surface diagnostics are in `output/surface_diag_<COIN>.csv`.
+
 ## Today (26-Nov-2026 16:00 UTC)
 
 | | ETH | BTC |
