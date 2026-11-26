@@ -116,6 +116,26 @@ On average the IV paid was almost the same at all three strikes: ETH ≈ 60.7%, 
 
 Reproduce: `python3 research/strike_compare.py`. Per-month detail is in `output/strike_monthly_<COIN>_<funding>.csv`.
 
+## ATM calls (70–100) vs the perp long (unhedged part)
+
+One ATM call is about 0.545 delta. So 40 delta ≈ 73 calls, 80 calls ≈ 44 delta, and 90 calls ≈ 49 delta.
+Results are 3y with reinvesting. "P boot" is the chance the calls beat A over 36 months in the block bootstrap. "P phase" is the share of the 30 roll-start days on which the calls beat A.
+
+| | ATM calls | B (calls) | A40 | P boot vs A40 / same-delta A | P phase | B maxDD / A maxDD | B worst month / A worst month |
+|---|---|---|---|---|---|---|---|
+| ETH, basis ~15% | 73 / 80 / 90 | +90% / +90% / +90% | +41% | 0.96 / 0.92 / 0.85 · 0.95–0.96 | 1.00 | −33 to −40% / −30% | −6 to −7% / −14% |
+| ETH, basis ~5% | 73 / 80 / 90 | +44% / +45% / +45% | +19% | 0.86 / 0.81 / 0.74 · 0.85–0.86 | 0.90 | −36 to −43% / −31% | −7 to −8% / −14% |
+| BTC, basis ~15% | 73 / 80 / 90 | +89% / +90% / +92% | +73% | 0.71 / 0.70 / 0.67 · 0.70–0.71 | 0.40–0.43 | −22 to −28% / −19% | −5 to −6% / −9% |
+| BTC, basis ~7% | 73 / 80 / 90 | +48% / +50% / +51% | +50% | 0.47 / 0.49 / 0.50 · 0.46–0.48 | 0.03–0.13 | −24 to −30% / −20% | −7 to −8% / −10% |
+
+**Breakeven flat basis (monthly-expiry path):**
+- ETH: none. The calls win even at −10% APR.
+- BTC: ≈ 7.5–8% APR. The phase sweep shows the BTC edge depends on roll timing.
+
+**Sizing:** going above about 75–80 ATM calls adds almost nothing to compounded return, and each +10 calls deepens the drawdown by about 2–3 pts.
+
+Reproduce: `python3 research/atm_vs_perp.py`.
+
 ## Today (26-Nov-2026 16:00 UTC)
 
 | | ETH | BTC |
