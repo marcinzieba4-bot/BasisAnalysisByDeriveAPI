@@ -205,6 +205,52 @@ def deribit_option_iv_samples(cur: str, lo: float = 1.02, hi: float = 1.09) -> p
     return pd.DataFrame(out)
 
 
+def deribit_surface_trades(cur: str) -> pd.DataFrame:
+    """All option trades (every expiry/strike) in the 24h after 08:00 UTC on each
+    monthly date (last Friday) plus the last 24h, filtered to OTM-ish strikes
+    (strike/spot 0.75-1.5) and 5-460 days to expiry. Used to fit a monthly IV
+    surface (moneyness x tenor) for pricing and marking 1-12M options."""
+    dates = [d for d in monthly_expiries(datetime(2023, 11, 1, tzinfo=timezone.utc), END) if d < END]
+    windows = [(d, d + timedelta(hours=24)) for d in dates] + [(END - timedelta(hours=24), END)]
+    out = []
+    for t0, t1 in windows:
+        t = ms(t0)
+        n = 0
+        while True:
+            d = get(
+                "https://history.deribit.com/api/v2/public/get_last_trades_by_currency_and_time",
+                {"currency": cur, "kind": "option", "start_timestamp": t, "end_timestamp": ms(t1),
+                 "count": 1000, "include_old": "true", "sorting": "asc"},
+            )["result"]
+            trs = d["trades"]
+            for tr in trs:
+                parts = tr["instrument_name"].split("-")
+                if len(parts) != 4 or not tr.get("iv"):
+                    continue
+                try:
+                    exp = datetime.strptime(parts[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                k = float(parts[2])
+                ts = datetime.fromtimestamp(tr["timestamp"] / 1000, tz=timezone.utc)
+                dte = (exp - ts).total_seconds() / 86400
+                m = k / tr["index_price"]
+                if not (5 <= dte <= 460 and 0.75 <= m <= 1.5):
+                    continue
+                out.append({"date": t0.replace(tzinfo=None), "time": ts.replace(tzinfo=None),
+                            "instrument": tr["instrument_name"], "type": parts[3], "strike": k,
+                            "expiry": exp.replace(tzinfo=None), "dte": dte, "index_price": tr["index_price"],
+                            "moneyness": m, "iv": float(tr["iv"]), "price_coin": float(tr["price"]),
+                            "amount": float(tr["amount"]), "direction": tr["direction"]})
+                n += 1
+            if not trs or not d.get("has_more"):
+                break
+            t = trs[-1]["timestamp"] + 1
+            time.sleep(0.05)
+        print(f"  {cur} surface {t0:%Y-%m-%d}: {n} trades kept", file=sys.stderr)
+    return pd.DataFrame(out)
+
+
 def main():
     force = "--force" in sys.argv
     for prod, cur in (("BTC-USD", "BTC"), ("ETH-USD", "ETH")):
@@ -217,6 +263,7 @@ def main():
             # ATM band (strike 95-101.9% of spot) and 10%-OTM band (109.1-113%)
             (f"optiv_atm_{cur}.csv", lambda: deribit_option_iv_samples(cur, 0.95, 1.019)),
             (f"optiv_otm10_{cur}.csv", lambda: deribit_option_iv_samples(cur, 1.091, 1.13)),
+            (f"surface_{cur}.csv", lambda: deribit_surface_trades(cur)),
         ]
         for fname, fn in jobs:
             path = os.path.join(DATA, fname)
