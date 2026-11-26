@@ -168,10 +168,10 @@ def deribit_inst_trades(name: str, t0: datetime, t1: datetime) -> list[dict]:
     return (d.get("result") or {}).get("trades", []) if isinstance(d, dict) else []
 
 
-def deribit_option_iv_samples(cur: str) -> pd.DataFrame:
+def deribit_option_iv_samples(cur: str, lo: float = 1.02, hi: float = 1.09) -> pd.DataFrame:
     """At every monthly roll (last Friday 08:00 UTC) pull real Deribit trades, in the
-    24h after the roll, of next-monthly calls struck ~2-9% OTM. Gives the actual IV a
-    buyer of a 5%-OTM monthly call paid (taker-buy trades ~= ask)."""
+    24h after the roll, of next-monthly calls struck at strike/spot in [lo, hi]
+    (default ~2-9% OTM). Gives the actual IV a buyer paid (taker-buy trades ~= ask)."""
     fund = pd.read_csv(os.path.join(DATA, f"funding_deribit_{cur}.csv"), parse_dates=["time"])
     fund = fund.set_index(fund["time"].dt.floor("h"))["index_price"]
     exps = monthly_expiries(datetime(2023, 10, 1, tzinfo=timezone.utc), END)
@@ -185,8 +185,8 @@ def deribit_option_iv_samples(cur: str) -> pd.DataFrame:
             continue
         spot = float(fund.loc[key])
         code = f"{nxt.day}{nxt.strftime('%b').upper()}{nxt.strftime('%y')}"
-        strikes = sorted({k for g in grids for k in range(int(spot * 1.02 // g * g), int(spot * 1.10), g)
-                          if spot * 1.02 <= k <= spot * 1.09})
+        strikes = sorted({k for g in grids for k in range(int(spot * lo // g * g), int(spot * (hi + 0.01)), g)
+                          if spot * lo <= k <= spot * hi})
         for k in strikes:
             name = f"{cur}-{code}-{k}-C"
             for tr in deribit_inst_trades(name, roll, roll + timedelta(hours=24)):
@@ -214,6 +214,9 @@ def main():
             (f"funding_deribit_{cur}.csv", lambda: deribit_funding(f"{cur}-PERPETUAL")),
             (f"funding_hl_{cur}.csv", lambda: hl_funding(cur)),
             (f"optiv_{cur}.csv", lambda: deribit_option_iv_samples(cur)),
+            # ATM band (strike 95-101.9% of spot) and 10%-OTM band (109.1-113%)
+            (f"optiv_atm_{cur}.csv", lambda: deribit_option_iv_samples(cur, 0.95, 1.019)),
+            (f"optiv_otm10_{cur}.csv", lambda: deribit_option_iv_samples(cur, 1.091, 1.13)),
         ]
         for fname, fn in jobs:
             path = os.path.join(DATA, fname)

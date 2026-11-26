@@ -90,18 +90,23 @@ def load(cur: str):
     fund_hl = fund_hl.reindex(spot_h.index).fillna(0.0)
 
     dvol = pd.read_csv(os.path.join(DATA, f"dvol_{cur}.csv"), parse_dates=["date"]).set_index("date")["dvol"] / 100
-    opt = pd.read_csv(os.path.join(DATA, f"optiv_{cur}.csv"), parse_dates=["roll", "expiry", "time"])
+    import glob
+    files = sorted(glob.glob(os.path.join(DATA, f"optiv*_{cur}.csv")))
+    opt = pd.concat([pd.read_csv(f, parse_dates=["roll", "expiry", "time"]) for f in files if os.path.getsize(f) > 5])
+    opt = opt.drop_duplicates(["instrument", "time", "amount", "iv"])
     return spot_h, {"hyperliquid": fund_hl, "deribit": fund_der}, dvol, opt
 
 
-def roll_quotes(opt: pd.DataFrame, dvol: pd.Series, spot_h: pd.Series) -> pd.DataFrame:
-    """Per roll: IV a buyer paid for ~5% OTM next-monthly call, and the forward carry."""
+def roll_quotes(opt: pd.DataFrame, dvol: pd.Series, spot_h: pd.Series, lo: float = 1.03,
+                hi: float = 1.07) -> pd.DataFrame:
+    """Per roll: IV a buyer paid for a next-monthly call struck at strike/spot in [lo, hi]
+    (default ~5% OTM), and the forward carry."""
     rows = []
     for roll, d in opt.groupby("roll"):
         exp = d["expiry"].iloc[0]
         T = (exp - roll).total_seconds() / (365 * 86400)
         S = float(spot_h.get(roll, np.nan))
-        near = d[d["moneyness"].between(1.03, 1.07)]
+        near = d[d["moneyness"].between(lo, hi)]
         buys = near[near["direction"] == "buy"]
         if len(buys) >= 3:
             iv = np.average(buys["iv"], weights=buys["amount"]) / 100
