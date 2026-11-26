@@ -251,6 +251,55 @@ def deribit_surface_trades(cur: str) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def deribit_weekly_surface_trades(cur: str) -> pd.DataFrame:
+    """Short-dated surface: all option trades 08:00-11:00 UTC on every Friday (the
+    weekly expiry/roll time) plus the last 24h; keeps 3-45 days to expiry and
+    strike/spot 0.8-1.3. Used for 1W / 2W / 4W call pricing and marking."""
+    fridays = []
+    d = datetime(2023, 11, 24, 8, tzinfo=timezone.utc)
+    while d < END - timedelta(hours=3):
+        fridays.append(d)
+        d += timedelta(days=7)
+    windows = [(f, f + timedelta(hours=3)) for f in fridays] + [(END - timedelta(hours=24), END)]
+    out = []
+    for t0, t1 in windows:
+        t = ms(t0)
+        n = 0
+        while True:
+            d = get(
+                "https://history.deribit.com/api/v2/public/get_last_trades_by_currency_and_time",
+                {"currency": cur, "kind": "option", "start_timestamp": t, "end_timestamp": ms(t1),
+                 "count": 1000, "include_old": "true", "sorting": "asc"},
+            )["result"]
+            trs = d["trades"]
+            for tr in trs:
+                parts = tr["instrument_name"].split("-")
+                if len(parts) != 4 or not tr.get("iv"):
+                    continue
+                try:
+                    exp = datetime.strptime(parts[1], "%d%b%y").replace(hour=8, tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                k = float(parts[2])
+                ts = datetime.fromtimestamp(tr["timestamp"] / 1000, tz=timezone.utc)
+                dte = (exp - ts).total_seconds() / 86400
+                m = k / tr["index_price"]
+                if not (3 <= dte <= 45 and 0.8 <= m <= 1.3):
+                    continue
+                out.append({"date": t0.replace(tzinfo=None), "time": ts.replace(tzinfo=None),
+                            "instrument": tr["instrument_name"], "type": parts[3], "strike": k,
+                            "expiry": exp.replace(tzinfo=None), "dte": dte, "index_price": tr["index_price"],
+                            "moneyness": m, "iv": float(tr["iv"]), "price_coin": float(tr["price"]),
+                            "amount": float(tr["amount"]), "direction": tr["direction"]})
+                n += 1
+            if not trs or not d.get("has_more"):
+                break
+            t = trs[-1]["timestamp"] + 1
+            time.sleep(0.05)
+        print(f"  {cur} weekly surface {t0:%Y-%m-%d}: {n} trades kept", file=sys.stderr)
+    return pd.DataFrame(out)
+
+
 def main():
     force = "--force" in sys.argv
     for prod, cur in (("BTC-USD", "BTC"), ("ETH-USD", "ETH")):
@@ -264,6 +313,7 @@ def main():
             (f"optiv_atm_{cur}.csv", lambda: deribit_option_iv_samples(cur, 0.95, 1.019)),
             (f"optiv_otm10_{cur}.csv", lambda: deribit_option_iv_samples(cur, 1.091, 1.13)),
             (f"surface_{cur}.csv", lambda: deribit_surface_trades(cur)),
+            (f"wsurface_{cur}.csv", lambda: deribit_weekly_surface_trades(cur)),
         ]
         for fname, fn in jobs:
             path = os.path.join(DATA, fname)
